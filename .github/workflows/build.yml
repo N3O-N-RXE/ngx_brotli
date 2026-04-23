@@ -1,0 +1,116 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      nginx_version:
+        description: "nginx version to build against"
+        required: true
+        type: string
+        default: "1.29.8"
+  push:
+    tags:
+      - "build-*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up QEMU
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Determine nginx version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ver="${{ inputs.nginx_version }}"
+          else
+            ref="${{ github.ref_name }}"
+            ver="${ref#build-}"
+          fi
+          if [ -z "$ver" ]; then
+            echo "Could not determine nginx version" >&2
+            exit 1
+          fi
+          echo "nginx_version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Building against nginx-$ver"
+
+      - name: Build modules in debian:12 container
+        env:
+          NGINX_VERSION: ${{ steps.version.outputs.nginx_version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          docker run --rm \
+            --platform="linux/${ARCH}" \
+            -e NGINX_VERSION \
+            -e ARCH \
+            -v "$GITHUB_WORKSPACE":/src \
+            -w /src \
+            debian:12 \
+            bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential cmake ca-certificates curl \
+                libpcre3-dev zlib1g-dev libssl-dev xz-utils
+
+              workdir=$(mktemp -d)
+              cd "$workdir"
+              curl -fsSL -o nginx.tar.gz "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+              tar -xzf nginx.tar.gz
+              cd "nginx-${NGINX_VERSION}"
+
+              ./configure --with-compat --add-dynamic-module=/src
+              make -j"$(nproc)" modules
+
+              install -d /src/output
+              cp objs/ngx_http_brotli_filter_module.so /src/output/
+              cp objs/ngx_http_brotli_static_module.so /src/output/
+              strip /src/output/*.so || true
+              chown -R '"$(id -u)":"$(id -g)"' /src/output
+            '
+
+      - name: Package modules
+        env:
+          NGINX_VERSION: ${{ steps.version.outputs.nginx_version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          pkg="ngx_brotli-nginx-${NGINX_VERSION}-linux-${ARCH}"
+          mkdir -p "dist/${pkg}"
+          cp output/*.so "dist/${pkg}/"
+          tar -czf "dist/${pkg}.tar.gz" -C dist "${pkg}"
+          ls -l dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ngx_brotli-nginx-${{ steps.version.outputs.nginx_version }}-linux-${{ matrix.arch }}
+          path: dist/ngx_brotli-nginx-${{ steps.version.outputs.nginx_version }}-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+      - name: Publish release assets
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/build-')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ngx_brotli for nginx ${{ steps.version.outputs.nginx_version }}
+          files: dist/ngx_brotli-nginx-${{ steps.version.outputs.nginx_version }}-linux-${{ matrix.arch }}.tar.gz
