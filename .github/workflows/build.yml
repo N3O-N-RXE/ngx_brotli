@@ -72,6 +72,12 @@ jobs:
                 build-essential cmake ca-certificates curl \
                 libpcre3-dev zlib1g-dev libssl-dev xz-utils
 
+              # Build the bundled brotli static libraries (required by ngx_brotli filter/config)
+              mkdir -p /src/deps/brotli/out
+              cd /src/deps/brotli/out
+              cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF ..
+              cmake --build . --config Release -j"$(nproc)" --target brotlienc
+
               workdir=$(mktemp -d)
               cd "$workdir"
               curl -fsSL -o nginx.tar.gz "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
